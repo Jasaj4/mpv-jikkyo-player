@@ -1,0 +1,223 @@
+#!/usr/bin/env lua
+-- jikkyo-player — CLI entry point
+-- TS file -> niconico jikkyo comments -> ASS subtitle output
+
+local sep = package.config:sub(1,1) or "/"
+local dir = arg[0]:match("(.*[/\\])") or ("." .. sep)
+package.path = dir .. "../lib/?.lua;" .. package.path
+
+local ts_parser = require("ts_parser")
+local jikkyo_api = require("jikkyo_api")
+local danmaku_renderer = require("danmaku_renderer")
+local arib = require("arib")
+
+---------------------------------------------------------------------------
+-- Usage
+---------------------------------------------------------------------------
+local function usage(exit_code)
+    io.stderr:write([[
+Usage: jikkyo-player <ts_file> [options]
+
+Options:
+  -o, --output <path>    Output file path (default: stdout)
+  --no-arib              Skip ARIB caption extraction
+  --arib-script <path>   Path to arib-ts2ass.js
+  --info                 Show TS stream info only (JSON)
+  --fetch-only           Fetch XML only (no ASS conversion)
+  -h, --help             Show this help
+
+Workflow:
+  1. Parse TS -> extract channel & timing info
+  2. Fetch niconico jikkyo comments from API
+  3. Convert XML comments -> ASS subtitles
+  4. (Optional) Extract ARIB captions and merge
+  5. Output ASS
+]])
+    os.exit(exit_code or 1)
+end
+
+---------------------------------------------------------------------------
+-- Parse command line arguments
+---------------------------------------------------------------------------
+local ts_file = nil
+local output_path = nil
+local no_arib = false
+local arib_script = nil
+local info_only = false
+local fetch_only = false
+
+local i = 1
+while i <= #arg do
+    local a = arg[i]
+    if a == "-o" or a == "--output" then
+        i = i + 1
+        output_path = arg[i]
+    elseif a == "--no-arib" then
+        no_arib = true
+    elseif a == "--arib-script" then
+        i = i + 1
+        arib_script = arg[i]
+    elseif a == "--info" then
+        info_only = true
+    elseif a == "--fetch-only" then
+        fetch_only = true
+    elseif a == "-h" or a == "--help" then
+        usage(0)
+    elseif a:sub(1,1) ~= "-" then
+        ts_file = a
+    else
+        io.stderr:write("Unknown option: " .. a .. "\n")
+        os.exit(1)
+    end
+    i = i + 1
+end
+
+if not ts_file then
+    usage()
+end
+
+---------------------------------------------------------------------------
+-- Logging
+---------------------------------------------------------------------------
+local function log(level, message)
+    io.stderr:write(string.format("[%s] %s\n", level, message))
+end
+
+---------------------------------------------------------------------------
+-- Step 1: Parse TS stream
+---------------------------------------------------------------------------
+local info = ts_parser.parse(ts_file, log)
+if not info then
+    io.stderr:write("Error: failed to parse TS stream\n")
+    os.exit(1)
+end
+
+---------------------------------------------------------------------------
+-- --info: print stream info and exit
+---------------------------------------------------------------------------
+if info_only then
+    -- Simple JSON output (no dependency on json library)
+    local parts = {"{"}
+    if info.onid then
+        parts[#parts+1] = string.format('  "onid": %d,', info.onid)
+        parts[#parts+1] = string.format('  "tsid": %d,', info.tsid)
+        parts[#parts+1] = string.format('  "sid": %d,', info.sid)
+    end
+    if info.rec_start then
+        parts[#parts+1] = string.format('  "rec_start": %d,', info.rec_start)
+    end
+    if info.rec_end then
+        parts[#parts+1] = string.format('  "rec_end": %d,', info.rec_end)
+    end
+    local jk_id = info.onid and jikkyo_api.resolve_channel(info.onid, info.sid)
+    if jk_id then
+        parts[#parts+1] = string.format('  "jk_id": "%s",', jk_id)
+    end
+    -- EIT events
+    for idx = 0, 1 do
+        if info.eit_events[idx] then
+            parts[#parts+1] = string.format('  "eit_%d_start": %d,', idx, info.eit_events[idx].start)
+            parts[#parts+1] = string.format('  "eit_%d_duration": %d,', idx, info.eit_events[idx].dur)
+        end
+    end
+    -- Remove trailing comma from last entry
+    local last = parts[#parts]
+    if last and last:sub(-1) == "," then
+        parts[#parts] = last:sub(1, -2)
+    end
+    parts[#parts+1] = "}"
+    print(table.concat(parts, "\n"))
+    os.exit(0)
+end
+
+---------------------------------------------------------------------------
+-- Step 2: Resolve channel
+---------------------------------------------------------------------------
+if not info.onid then
+    io.stderr:write("Error: no ONID found in TS stream\n")
+    os.exit(1)
+end
+
+local jk_id = jikkyo_api.resolve_channel(info.onid, info.sid)
+if not jk_id then
+    io.stderr:write(string.format("Error: unknown channel ONID=%d SID=%d\n", info.onid, info.sid))
+    os.exit(1)
+end
+log("info", "Channel: " .. jk_id)
+
+---------------------------------------------------------------------------
+-- Step 3: Determine time range
+---------------------------------------------------------------------------
+local start_ts = info.rec_start
+local end_ts = info.rec_end
+if not start_ts or not end_ts then
+    io.stderr:write("Error: TOT incomplete (need both head and tail timestamps)\n")
+    os.exit(1)
+end
+log("info", string.format("Time range: %d -> %d (%ds)", start_ts, end_ts, end_ts - start_ts))
+
+---------------------------------------------------------------------------
+-- Step 4: Fetch XML from API
+---------------------------------------------------------------------------
+local xml_string, err = jikkyo_api.fetch(jk_id, start_ts, end_ts)
+if not xml_string then
+    io.stderr:write("Error: " .. (err or "unknown fetch error") .. "\n")
+    os.exit(1)
+end
+log("info", "API fetch successful")
+
+if fetch_only then
+    local out = io.stdout
+    if output_path then
+        out = io.open(output_path, "w")
+        if not out then
+            io.stderr:write("Error: cannot open output file: " .. output_path .. "\n")
+            os.exit(1)
+        end
+    end
+    out:write(xml_string)
+    if output_path then out:close() end
+    os.exit(0)
+end
+
+---------------------------------------------------------------------------
+-- Step 5: Render ASS
+---------------------------------------------------------------------------
+local ass_content, count = danmaku_renderer.render(xml_string, info.rec_start)
+log("info", string.format("Rendered %d comments to ASS", count))
+
+---------------------------------------------------------------------------
+-- Step 6: ARIB caption merge (optional)
+---------------------------------------------------------------------------
+if not no_arib then
+    arib_script = arib_script or (dir .. "../vendor/arib-ts2ass.js/arib-ts2ass.js")
+end
+if not no_arib and arib_script then
+    local arib_content = arib.extract(ts_file, arib_script)
+    if arib_content then
+        local cap_styles, cap_dialogues = arib.parse_ass(arib_content)
+        if #cap_dialogues > 0 then
+            log("info", string.format("Merging %d ARIB caption lines", #cap_dialogues))
+            local style_block = table.concat(cap_styles, "\n")
+            ass_content = ass_content:gsub(
+                "(\n%[Events%])",
+                "\n" .. style_block .. "%1"
+            )
+            ass_content = ass_content .. table.concat(cap_dialogues, "\n") .. "\n"
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Step 7: Output
+---------------------------------------------------------------------------
+local out = io.stdout
+if output_path then
+    out = io.open(output_path, "w")
+    if not out then
+        io.stderr:write("Error: cannot open output file: " .. output_path .. "\n")
+        os.exit(1)
+    end
+end
+out:write(ass_content)
+if output_path then out:close() end

@@ -1,0 +1,5 @@
+.DS_Store
+*.ass
+_dev
+.claude
+vendor/
