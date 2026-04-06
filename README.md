@@ -3,7 +3,7 @@
 テレビ録画TSファイルを元にニコニコ実況コメントを取得し、ASS字幕として表示するツール。
 
 mpvプレイヤー向け。CLI単体でも使用可能。MacOS / Linux / Windows 対応。
-
+<img width="1072" height="652" alt="Image" src="https://github.com/user-attachments/assets/f5b5557c-fc26-45d9-bd95-291941b59759" />
 ## 機能
 
 - TSストリームからEIT/TOT/チャンネル情報を直接パースし、ニコニコ実況APIからコメントを自動取得
