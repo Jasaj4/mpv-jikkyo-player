@@ -13,29 +13,55 @@ local M = {}
 --                  SID  -> jk_id (BS)
 ---------------------------------------------------------------------------
 local ONID_TO_JK = {
+    -- NHK総合 (各地域)
     [32336] = "jk1",   -- NHK総合・水戸
     [32736] = "jk1",   -- NHK総合・東京
+    -- NHKEテレ
     [32737] = "jk2",   -- NHKEテレ東京
+    -- 在京キー局
     [32738] = "jk4",   -- 日本テレビ
     [32741] = "jk5",   -- テレビ朝日
     [32739] = "jk6",   -- TBS
     [32742] = "jk7",   -- テレビ東京
     [32740] = "jk8",   -- フジテレビ
+    -- 独立局
     [32391] = "jk9",   -- TOKYO MX
-    [32327] = "jk12",  -- チバテレビ
+    [32343] = "jk10",  -- テレ玉
     [32375] = "jk11",  -- tvk
+    [32327] = "jk12",  -- チバテレビ
+    [32395] = "jk13",  -- サンテレビ
+    [32390] = "jk14",  -- KBS京都
 }
 
+-- BS (ONID=4) / CS SID -> jk_id
 local SID_TO_JK = {
+    -- NHK BS
     [101]  = "jk101",  -- NHK BS
+    [103]  = "jk103",  -- NHK BSプレミアム
+    -- BS在京キー局系
     [141]  = "jk141",  -- BS日テレ
     [151]  = "jk151",  -- BS朝日
     [161]  = "jk161",  -- BS-TBS
     [171]  = "jk171",  -- BSテレ東
     [181]  = "jk181",  -- BSフジ
+    -- WOWOW
     [191]  = "jk191",  -- WOWOWプライム
-    [211]  = "jk211",  -- BS11
-    [222]  = "jk222",  -- BS12
+    [192]  = "jk192",  -- WOWOWライブ
+    [193]  = "jk193",  -- WOWOWシネマ
+    -- BS10
+    [200]  = "jk200",  -- BS10
+    [201]  = "jk201",  -- BS10スターチャンネル
+    -- 無料BS
+    [211]  = "jk211",  -- BS11イレブン
+    [222]  = "jk222",  -- BS12トゥエルビ
+    -- 有料BS
+    [236]  = "jk236",  -- BSアニマックス
+    [252]  = "jk252",  -- WOWOW PLUS
+    [260]  = "jk260",  -- BS松竹東宝
+    [263]  = "jk263",  -- BSJapanext
+    [265]  = "jk265",  -- BSよしもと
+    -- CS (AT-X)
+    [333]  = "jk333",  -- AT-X
 }
 
 ---------------------------------------------------------------------------
@@ -44,7 +70,8 @@ local SID_TO_JK = {
 ---------------------------------------------------------------------------
 function M.resolve_channel(onid, sid)
     if ONID_TO_JK[onid] then return ONID_TO_JK[onid] end
-    if onid == 4 then
+    -- BS (ONID=4) / CS (ONID=6,7,10): resolve by SID
+    if onid == 4 or onid == 6 or onid == 7 or onid == 10 then
         if SID_TO_JK[sid] then return SID_TO_JK[sid] end
         local base = sid - (sid % 10) + 1
         if SID_TO_JK[base] then return SID_TO_JK[base] end
