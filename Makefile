@@ -19,7 +19,7 @@ VENDOR_DIR = $(CURDIR)/vendor
 ARIB_REPO = https://github.com/Jasaj4/arib-ts2ass.js.git
 ARIB_DIR = $(VENDOR_DIR)/arib-ts2ass.js
 
-install: install-core
+install: update install-core
 ifndef NO_ARIB
 	$(MAKE) install-arib
 endif
@@ -58,4 +58,8 @@ install-arib:
 		cd "$(ARIB_DIR)" && npm install; \
 	fi
 
-.PHONY: install install-core install-arib
+update:
+	@echo "jikkyo-player: 更新中..."
+	@git pull
+
+.PHONY: install install-core install-arib update
