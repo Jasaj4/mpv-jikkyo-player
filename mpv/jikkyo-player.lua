@@ -40,6 +40,9 @@ local opts = {
     danmaku_offset   = 0,
     -- Default subtitle track: "both", "danmaku", "arib"
     default_track    = "both",
+    -- ARIB subtitle reload interval in seconds during incremental extraction.
+    -- 0 = disable incremental reload (wait for full extraction before loading).
+    arib_reload_interval = 1,
     -- Colon-separated list of directories to recursively search for danmaku XML.
     -- When set, the same-directory lookup is skipped.
     -- Example: /path/to/xmls:/another/path
@@ -71,6 +74,14 @@ local cycle_order = { "danmaku", "arib", "both" }
 local danmaku_ass_content = nil
 local arib_ass_content = nil
 local active_track = nil  -- which track key is currently selected
+local user_selected_track = nil  -- track explicitly chosen by user (preserved across reloads)
+
+-- Incremental ARIB loading state
+local arib_poll_timer = nil
+local arib_incr_path = nil       -- path to the incrementally-written ASS file
+local arib_complete = false       -- true when "; EOF" detected
+local arib_last_size = 0          -- last known file size (to detect changes)
+local arib_pending_reload = false -- reload deferred until subtitle gap
 
 ---------------------------------------------------------------------------
 -- Platform detection
@@ -102,6 +113,19 @@ end
 -- Remove current danmaku subtitles (all tracks)
 ---------------------------------------------------------------------------
 local function cleanup()
+    -- Stop incremental polling
+    if arib_poll_timer then
+        arib_poll_timer:kill()
+        arib_poll_timer = nil
+    end
+    if arib_incr_path then
+        os.remove(arib_incr_path)
+        arib_incr_path = nil
+    end
+    arib_complete = false
+    arib_last_size = 0
+    arib_pending_reload = false
+
     for _, t in pairs(tracks) do
         if t.id then
             mp.commandv("sub-remove", t.id)
@@ -116,6 +140,7 @@ local function cleanup()
     danmaku_ass_content = nil
     arib_ass_content = nil
     active_track = nil
+    user_selected_track = nil
     loaded = false
     visible = true
 end
@@ -198,7 +223,13 @@ end
 -- Switch active subtitle to the best available track
 ---------------------------------------------------------------------------
 local function activate_best_track()
-    local best = select_best_track()
+    -- Respect user's explicit choice if they've switched tracks
+    local best
+    if user_selected_track and tracks[user_selected_track] and tracks[user_selected_track].id then
+        best = user_selected_track
+    else
+        best = select_best_track()
+    end
     if not best then return end
 
     local t = tracks[best]
@@ -255,6 +286,7 @@ local function cycle_danmaku_track()
         mp.set_property("sid", "no")
         visible = false
         active_track = nil
+        user_selected_track = nil
         mp.osd_message("字幕: off")
         notify_osc()
         return
@@ -264,6 +296,7 @@ local function cycle_danmaku_track()
     local t = tracks[next_key]
     mp.set_property_number("sid", t.id)
     active_track = next_key
+    user_selected_track = next_key
     visible = true
     mp.osd_message("字幕: " .. track_labels[next_key])
     notify_osc()
@@ -331,6 +364,229 @@ local function on_component_ready()
 end
 
 ---------------------------------------------------------------------------
+-- Incremental ARIB: reload a track by removing and re-adding
+-- (sub-reload internally does the same remove+add, so we do it explicitly
+--  to maintain control over track IDs and selection state)
+---------------------------------------------------------------------------
+local function reload_track(key, new_content, title)
+    local t = tracks[key]
+    if not t.path then return end
+
+    -- Write new content to the existing temp file path
+    local f = io.open(t.path, "w")
+    if not f then return end
+    f:write(new_content)
+    f:close()
+
+    local old_id = t.id
+    local was_active = (active_track == key)
+
+    -- Remove old track
+    if old_id then
+        mp.commandv("sub-remove", old_id)
+        t.id = nil
+    end
+
+    -- Re-add
+    local flag = was_active and "select" or "auto"
+    t.pending = true
+    mp.commandv("sub-add", t.path, flag, title)
+
+    mp.add_timeout(0.1, function()
+        t.pending = false
+        t.id = find_track_id_by_title(title)
+        if t.id and was_active then
+            active_track = key
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
+-- Incremental ARIB: check if it's safe to reload (subtitle gap)
+---------------------------------------------------------------------------
+local function is_subtitle_gap()
+    local sub_text = mp.get_property("sub-text", "")
+    if sub_text == "" then return true end
+
+    local sub_end = mp.get_property_number("sub-end")
+    local pos = mp.get_property_number("time-pos")
+    if sub_end and pos and (pos >= sub_end - 0.05) then
+        return true
+    end
+    return false
+end
+
+---------------------------------------------------------------------------
+-- Incremental ARIB: perform the actual reload of ARIB-related tracks
+---------------------------------------------------------------------------
+local function do_arib_reload()
+    arib_pending_reload = false
+
+    -- Determine which track the user wants (or default)
+    local effective = user_selected_track or active_track
+
+    -- Reload ARIB-only track if it exists
+    if tracks.arib.id then
+        reload_track("arib", arib_ass_content, "字幕")
+    end
+
+    -- Rebuild and reload merged track if it exists and danmaku is available
+    if tracks.both.id and danmaku_ass_content then
+        local merged = merge_arib(danmaku_ass_content, arib_ass_content)
+        if merged then
+            reload_track("both", merged, "弾幕+字幕")
+        end
+    end
+
+    -- Restore user's track selection after reload settles
+    if effective then
+        mp.add_timeout(0.15, function()
+            local t = tracks[effective]
+            if t and t.id then
+                mp.set_property_number("sid", t.id)
+                active_track = effective
+            end
+        end)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Incremental ARIB: schedule a reload, waiting for a subtitle gap
+---------------------------------------------------------------------------
+local arib_gap_timer = nil
+
+local function schedule_arib_reload()
+    if arib_pending_reload then return end  -- already scheduled
+    arib_pending_reload = true
+
+    -- Check for gap immediately
+    if is_subtitle_gap() then
+        do_arib_reload()
+        return
+    end
+
+    -- Poll for a gap, with a hard timeout of 5s
+    local elapsed = 0
+    if arib_gap_timer then arib_gap_timer:kill() end
+    arib_gap_timer = mp.add_periodic_timer(0.2, function()
+        elapsed = elapsed + 0.2
+        if not arib_pending_reload then
+            arib_gap_timer:kill()
+            arib_gap_timer = nil
+            return
+        end
+        if is_subtitle_gap() or elapsed >= 5 then
+            arib_gap_timer:kill()
+            arib_gap_timer = nil
+            do_arib_reload()
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
+-- Incremental ARIB: poll the output file for new content
+---------------------------------------------------------------------------
+local function poll_arib_file()
+    if not arib_incr_path then return end
+
+    local f = io.open(arib_incr_path, "r")
+    if not f then return end
+
+    local content = f:read("*a")
+    f:close()
+
+    if #content == 0 then return end
+    if #content == arib_last_size then return end
+    arib_last_size = #content
+
+    -- Check for EOF marker
+    local is_eof = content:find("; EOF%s*$") ~= nil
+
+    -- Strip EOF marker from content we'll use as ASS
+    local clean = content:gsub("; EOF%s*$", "")
+    arib_ass_content = clean
+
+    if is_eof then
+        arib_complete = true
+        -- Stop polling
+        if arib_poll_timer then
+            arib_poll_timer:kill()
+            arib_poll_timer = nil
+        end
+        msg.info("jikkyo-player: ARIB incremental extraction complete")
+    end
+
+    -- First time: create tracks via on_component_ready
+    if not tracks.arib.id and not tracks.arib.pending then
+        on_component_ready()
+    else
+        -- Subsequent updates: schedule a smart reload
+        schedule_arib_reload()
+    end
+end
+
+---------------------------------------------------------------------------
+-- Incremental ARIB: start the subprocess and polling timer
+---------------------------------------------------------------------------
+local function start_incremental_arib(script_path, ts_path)
+    local interval = opts.arib_reload_interval
+
+    if interval <= 0 then
+        -- Non-incremental: wait for full extraction (original behavior)
+        local tmp_ass = tmp_path("arib2ass")
+        mp.command_native_async({
+            name = "subprocess",
+            args = {"node", script_path, ts_path, tmp_ass},
+            capture_stdout = true,
+            capture_stderr = true,
+        }, function(success, result)
+            if success and result.status == 0 then
+                local af = io.open(tmp_ass, "r")
+                if af then
+                    local content = af:read("*a")
+                    af:close()
+                    os.remove(tmp_ass)
+                    msg.info("jikkyo-player: arib-ts2ass.js extracted captions")
+                    arib_ass_content = content
+                    on_component_ready()
+                    return
+                end
+            end
+            os.remove(tmp_ass)
+            msg.verbose("jikkyo-player: arib-ts2ass.js failed or produced no output")
+        end)
+        return
+    end
+
+    -- Incremental mode
+    arib_incr_path = tmp_path("arib_incr")
+    arib_complete = false
+    arib_last_size = 0
+    arib_pending_reload = false
+
+    -- Start arib-ts2ass.js with --incremental (fire and forget, don't capture stdout)
+    mp.command_native_async({
+        name = "subprocess",
+        args = {"node", script_path, ts_path, arib_incr_path, "--incremental"},
+        capture_stdout = false,
+        capture_stderr = false,
+    }, function(success, result)
+        -- Process finished — do a final poll to catch any last data
+        if not arib_complete then
+            poll_arib_file()
+        end
+        if not success or (result and result.status ~= 0) then
+            msg.verbose("jikkyo-player: arib-ts2ass.js exited with error")
+        end
+    end)
+
+    -- Start polling timer
+    local poll_sec = math.max(interval, 1)
+    arib_poll_timer = mp.add_periodic_timer(poll_sec, poll_arib_file)
+    msg.info("jikkyo-player: started incremental ARIB extraction (poll every " .. poll_sec .. "s)")
+end
+
+---------------------------------------------------------------------------
 -- Process XML string: parse -> render danmaku ASS, start ARIB extraction
 ---------------------------------------------------------------------------
 local function process_xml_string(xml_string, ts_path, rec_start_ts)
@@ -340,7 +596,7 @@ local function process_xml_string(xml_string, ts_path, rec_start_ts)
     danmaku_ass_content = ass_content
     on_component_ready()
 
-    -- Try to extract ARIB captions from TS file (async via mpv subprocess)
+    -- Try to extract ARIB captions from TS file (incremental via polling)
     if ts_path and arib then
         local script_dir = mp.get_script_directory()
         local script_path = utils.join_path(script_dir, "vendor/arib-ts2ass.js/arib-ts2ass.js")
@@ -348,29 +604,7 @@ local function process_xml_string(xml_string, ts_path, rec_start_ts)
         local check = io.open(script_path, "r")
         if check then
             check:close()
-            local tmp_ass = tmp_path("arib2ass")
-
-            mp.command_native_async({
-                name = "subprocess",
-                args = {"node", script_path, ts_path, tmp_ass},
-                capture_stdout = true,
-                capture_stderr = true,
-            }, function(success, result)
-                if success and result.status == 0 then
-                    local af = io.open(tmp_ass, "r")
-                    if af then
-                        local content = af:read("*a")
-                        af:close()
-                        os.remove(tmp_ass)
-                        msg.info("jikkyo-player: arib-ts2ass.js extracted captions")
-                        arib_ass_content = content
-                        on_component_ready()
-                        return
-                    end
-                end
-                os.remove(tmp_ass)
-                msg.verbose("jikkyo-player: arib-ts2ass.js failed or produced no output")
-            end)
+            start_incremental_arib(script_path, ts_path)
         else
             msg.verbose("jikkyo-player: arib-ts2ass.js not found at " .. script_path)
         end
