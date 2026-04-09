@@ -68,6 +68,7 @@ local function scan_ts_chunk(data, pkt_size, sync_pos, want_eit)
     local ts_off = pkt_size - 188
     local eit_events = {}
     local tot_time
+    local tot_chunk_pos          -- byte position (1-based) of TOT packet in data
     local onid, tsid, sid
     local pos = sync_pos
 
@@ -115,7 +116,7 @@ local function scan_ts_chunk(data, pkt_size, sync_pos, want_eit)
 
                         elseif pid == 0x0014 and (tid == 0x73 or tid == 0x70) then
                             local t = decode_mjd_bcd(data, s + 3)
-                            if t then tot_time = t end
+                            if t then tot_time = t; tot_chunk_pos = pos end
                         end
                     end
                 end
@@ -125,7 +126,7 @@ local function scan_ts_chunk(data, pkt_size, sync_pos, want_eit)
         pos = pos + advance
     end
 
-    return eit_events, tot_time, onid, tsid, sid
+    return eit_events, tot_time, onid, tsid, sid, tot_chunk_pos
 end
 
 ---------------------------------------------------------------------------
@@ -148,7 +149,7 @@ function M.parse(filepath, log_fn)
     if not pkt_size then f:close(); return nil end
 
     -- Scan head: EIT + first TOT + channel IDs
-    local eit_events, rec_start, onid, tsid, sid =
+    local eit_events, rec_start, onid, tsid, sid, head_tot_chunk_pos =
         scan_ts_chunk(head, pkt_size, sync_pos, true)
 
     -- Find the real end of data (skip trailing zero-padding)
@@ -195,8 +196,28 @@ function M.parse(filepath, log_fn)
         if tail and #tail >= 188 * 3 then
             local ps2, sp2 = detect_ts_sync(tail)
             if ps2 then
-                local _, last_tot = scan_ts_chunk(tail, ps2, sp2, false)
-                if last_tot then rec_end = last_tot end
+                local _, last_tot, _, _, _, tail_tot_chunk_pos =
+                    scan_ts_chunk(tail, ps2, sp2, false)
+                if last_tot then
+                    rec_end = last_tot
+                    -- Compute offset correction for rec_start
+                    if rec_start and head_tot_chunk_pos then
+                        local head_tot_file_pos = head_tot_chunk_pos - 1
+                        local tail_tot_file_pos = tail_offset + (tail_tot_chunk_pos - 1)
+                        local time_span = rec_end - rec_start
+                        if time_span > 0 then
+                            local bytes_per_sec = (tail_tot_file_pos - head_tot_file_pos) / time_span
+                            local ts_bytes_before_tot = head_tot_chunk_pos - sync_pos
+                            local offset_sec = ts_bytes_before_tot / bytes_per_sec
+                            if offset_sec > 0 then
+                                log("info", string.format(
+                                    "TOT offset correction: %.2fs (TOT found at %d bytes from TS start, %.0f bytes/sec)",
+                                    offset_sec, ts_bytes_before_tot, bytes_per_sec))
+                                rec_start = rec_start - offset_sec
+                            end
+                        end
+                    end
+                end
             end
         end
     end
